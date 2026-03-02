@@ -80,7 +80,6 @@ export const addressToString = (
 		address_2: address.address2,
 	} );
 
-	// Build address string with safe fallbacks
 	const parts = [
 		concatAddress,
 		address.city || '',

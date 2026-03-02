@@ -152,9 +152,13 @@ class AddressNormalizationService {
 		}
 
 		if ( isset( $response->field_errors ) ) {
+			$error_message = isset( $response->field_errors->general )
+				? $response->field_errors->general
+				: __( 'Address normalization failed', 'woocommerce-shipping' );
+
 			$error = new WP_Error(
 				'address_normalization_failed',
-				$response->field_errors->general,
+				$error_message,
 				$response->field_errors
 			);
 			$this->logger->log( $error, __CLASS__ );
@@ -407,6 +411,14 @@ class AddressNormalizationService {
 
 		if ( isset( $request_body['is_verified'] ) ) {
 			unset( $request_body['is_verified'] );
+		}
+
+		if ( isset( $request_body['is_approved'] ) ) {
+			unset( $request_body['is_approved'] );
+		}
+
+		if ( isset( $request_body['default_return_address'] ) ) {
+			unset( $request_body['default_return_address'] );
 		}
 
 		return $request_body;

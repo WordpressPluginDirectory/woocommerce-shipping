@@ -1,34 +1,42 @@
 import { MouseEventHandler } from 'react';
 import {
 	__experimentalSpacer as Spacer,
+	__experimentalText as Text,
+	Animate,
 	Button,
 	CheckboxControl,
+	ExternalLink,
 	Flex,
 	FlexBlock,
 	Notice,
 } from '@wordpress/components';
 import {
 	createInterpolateElement,
+	createPortal,
 	useCallback,
 	useEffect,
 	useLayoutEffect,
 	useMemo,
 	useState,
 } from '@wordpress/element';
-import { Link } from '@woocommerce/components';
+import { Link } from 'components/wc';
 import { __, sprintf } from '@wordpress/i18n';
 import { uniq } from 'lodash';
 import {
+	canManagePayments as canManagePaymentsUtil,
 	getAddPaymentMethodURL,
+	getParentIdFromSubItemId,
+	getUPSDAPTosApprovedVersionsFromError,
 	hasPaymentMethod,
 	hasSelectedPaymentMethod,
-	canManagePayments as canManagePaymentsUtil,
+	mapAddressForRequest,
 } from 'utils';
 import { CreditCardButton } from './credit-card-button';
 import { settingsPageUrl } from '../constants';
 import { useLabelPurchaseContext } from 'context/label-purchase';
 import { getShipmentTitle } from '../utils';
 import {
+	CoreDataInvalidateDispatch,
 	Label,
 	LabelPurchaseError,
 	Order,
@@ -36,6 +44,7 @@ import {
 	WPErrorRESTResponse,
 } from 'types';
 import { dispatch, select, useSelect } from '@wordpress/data';
+import { store as coreStore } from '@wordpress/core-data';
 import { labelPurchaseStore } from 'data/label-purchase';
 import { EssentialDetails } from '../essential-details';
 import { recordEvent } from 'utils/tracks';
@@ -43,10 +52,8 @@ import { LABEL_PURCHASE_STATUS } from 'data/constants';
 import { UPSDAPTos } from 'components/carrier/upsdap/upsdap-tos';
 import apiFetch from '@wordpress/api-fetch';
 import { getCarrierStrategyPath } from 'data/routes';
-import {
-	mapAddressForRequest,
-	getUPSDAPTosApprovedVersionsFromError,
-} from 'utils';
+import { getChangePaymentMethodUrl } from 'components/shipping-settings/constants';
+import { usePaymentMethodPolling } from './use-payment-method-polling';
 
 interface PaymentButtonsProps {
 	order: Order;
@@ -61,6 +68,8 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 			currentShipmentId,
 			getShipmentOrigin,
 			isExtraLabelPurchaseValid,
+			getShipmentType,
+			getCurrentShipmentIsReturn,
 		},
 		labels: {
 			selectedLabelSize,
@@ -78,10 +87,20 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 			canPurchase,
 			setAccountCompleteOrder,
 			getAccountCompleteOrder,
+			getNextPaymentMethod,
+			getSubscriptionId,
 		},
+		nextDesign,
 	} = useLabelPurchaseContext();
+	const nextPaymentMethod = getNextPaymentMethod();
+	const subscriptionId = getSubscriptionId();
+	const changePaymentMethodUrl = getChangePaymentMethodUrl( subscriptionId );
+
 	const lastOrderCompleted = getAccountCompleteOrder();
 	const [ errors, setErrors ] = useState< LabelPurchaseError | null >( null );
+	const [ purchaseStartTime, setPurchaseStartTime ] = useState<
+		number | null
+	>( null );
 	const [ markOrderAsCompleted, setMarkOrderAsCompleted ] =
 		useState( lastOrderCompleted );
 	const orderStatus = select( labelPurchaseStore ).getOrderStatus();
@@ -101,6 +120,26 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 	const resetErrors = () => {
 		setErrors( null );
 	};
+
+	const invalidateSiteSettingsRecord = useCallback( () => {
+		const coreDataDispatch = dispatch(
+			coreStore
+		) as unknown as CoreDataInvalidateDispatch;
+
+		void coreDataDispatch.invalidateResolution( 'getEntityRecord', [
+			'root',
+			'site',
+			undefined,
+		] );
+	}, [] );
+
+	const {
+		isPolling: isPaymentMethodPolling,
+		startPolling: startPaymentMethodPolling,
+	} = usePaymentMethodPolling( {
+		isResolved: !! nextPaymentMethod,
+		onPoll: invalidateSiteSettingsRecord,
+	} );
 
 	const purchaseAPIErrors = useSelect(
 		( s ) =>
@@ -129,14 +168,21 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 	}, [ isPurchasing ] );
 
 	const shipmentsCount = Object.keys( shipments ).length;
-	const purchaseButtonLabel =
+	const purchaseButtonLabelDefault =
 		shipmentsCount > 1
 			? sprintf(
 					// translators: %s is the shipment title as Shipment 1/2, Shipment 2/2, etc.
 					__( 'Purchase %s', 'woocommerce-shipping' ),
-					getShipmentTitle( currentShipmentId, shipmentsCount )
+					getShipmentTitle(
+						currentShipmentId,
+						shipmentsCount,
+						getShipmentType( currentShipmentId )
+					)
 			  )
 			: __( 'Purchase label', 'woocommerce-shipping' );
+	const purchaseButtonLabel = nextDesign
+		? __( 'Buy shipping label', 'woocommerce-shipping' )
+		: purchaseButtonLabelDefault;
 
 	const addCardButtonDescription = (
 		onAddCard: MouseEventHandler< HTMLAnchorElement >
@@ -148,14 +194,9 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 			),
 			{
 				a: (
-					<Link
-						onClick={ onAddCard }
-						type="external"
-						href="#"
-						role="button"
-					>
+					<ExternalLink onClick={ onAddCard } href="#" role="button">
 						{ ' ' }
-					</Link>
+					</ExternalLink>
 				),
 			}
 		);
@@ -246,7 +287,13 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 					// Find selected sub-items for current item
 					const selectedSubItems = item.subItems.filter(
 						( subItem ) =>
-							selection.some( ( s ) => s.id === subItem.id )
+							selection.some(
+								( s ) =>
+									s.id ===
+										getParentIdFromSubItemId(
+											subItem.id
+										) || s.id === subItem.id
+							)
 					);
 
 					// An item with all subitems selected
@@ -327,14 +374,23 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 			order_destination_country: order.shipping_address.country,
 			carrier_id: getSelectedRate()?.rate.carrierId,
 			rate: getSelectedRate()?.rate.rate,
-			list_rate: getSelectedRate()?.rate.listRate,
 			retail_rate: getSelectedRate()?.rate.retailRate,
 			service_id: getSelectedRate()?.rate.serviceId,
 		};
-		recordEvent(
-			'label_purchase_purchase_shipping_label_clicked',
-			tracksProperties
-		);
+
+		if ( nextDesign ) {
+			setPurchaseStartTime( Date.now() );
+			recordEvent( 'shipping_label_button_click', {
+				button_label: 'buy_shipping_label',
+				...tracksProperties,
+			} );
+		} else {
+			recordEvent(
+				'label_purchase_purchase_shipping_label_clicked',
+				tracksProperties
+			);
+		}
+
 		resetErrors();
 		try {
 			await requestLabelPurchase( order.id, rate );
@@ -350,8 +406,21 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 				LabelPurchaseError;
 
 			if ( error.code === 'missing_upsdap_terms_of_service_acceptance' ) {
+				setPurchaseStartTime( null );
 				setUPSDAPTosError( error );
 				return;
+			}
+
+			if ( nextDesign ) {
+				setPurchaseStartTime( null );
+				const errorCode =
+					( error as LabelPurchaseError ).code ??
+					( error as LabelPurchaseError ).cause ??
+					( error as WPErrorRESTResponse ).data?.status ??
+					'unknown';
+				recordEvent( 'shipping_label_purchase_error', {
+					error_code: String( errorCode ),
+				} );
 			}
 
 			// If it's not the UPS DAP TOS error, treat it as a standard LabelPurchaseError.
@@ -414,6 +483,16 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 					const switchedRate = matchAndSelectRate( selectedRate );
 					if ( switchedRate ) {
 						purchaseLabel( switchedRate );
+					} else {
+						setErrors( {
+							cause: 'rate_mismatch',
+							message: [
+								__(
+									'The shipping rate has changed significantly. Please review the available rates and select one to continue.',
+									'woocommerce-shipping'
+								),
+							],
+						} );
 					}
 				}
 			} catch {
@@ -442,11 +521,140 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 	// Reset errors when shipment origin changes
 	useEffect( resetErrors, [ shipmentOrigin ] );
 
+	// Fire the success event only after the full purchase cycle completes,
+	// including any async status polling (PURCHASE_IN_PROGRESS → PURCHASED).
+	// purchaseStartTime is set on button click and cleared on error, so this
+	// effect is a no-op on mount and after failed purchases.
+	useEffect( () => {
+		if (
+			nextDesign &&
+			purchaseStartTime !== null &&
+			! isPurchasing &&
+			! isUpdatingStatus &&
+			hasPurchasedLabel()
+		) {
+			recordEvent( 'shipping_label_purchase_success', {
+				response_time_ms: Date.now() - purchaseStartTime,
+			} );
+			setPurchaseStartTime( null );
+		}
+	}, [
+		nextDesign,
+		purchaseStartTime,
+		isPurchasing,
+		isUpdatingStatus,
+		hasPurchasedLabel,
+	] );
+
 	const isExtraLabelPurchase = () => {
 		return ! hasMissingPurchase();
 	};
 
-	return (
+	return nextDesign ? (
+		<>
+			{ UPSDAPTosError && (
+				<UPSDAPTos
+					close={ handleUPSDAPTos.close }
+					confirm={ handleUPSDAPTos.confirm }
+					shipmentOrigin={ shipmentOrigin }
+					acceptedVersions={ getUPSDAPTosApprovedVersionsFromError(
+						UPSDAPTosError
+					) }
+					isConfirming={ isTOSConfirming }
+					setIsConfirming={ setIsTOSConfirming }
+				/>
+			) }
+			{ nextPaymentMethod && (
+				<Button
+					variant="primary"
+					disabled={
+						! selectedRate ||
+						isPurchasing ||
+						isFetching ||
+						isUpdatingStatus ||
+						hasPurchasedLabel( false ) ||
+						! shipmentOrigin.isApproved ||
+						( isExtraLabelPurchase() &&
+							! isExtraLabelPurchaseValid() )
+					}
+					onClick={ () => {
+						const rate = getSelectedRate();
+						if ( rate ) {
+							purchaseLabel( rate );
+						}
+					} }
+					isBusy={ isPurchasing }
+					aria-disabled={
+						! selectedRate ||
+						isPurchasing ||
+						isFetching ||
+						hasPurchasedLabel( false ) ||
+						! shipmentOrigin.isApproved ||
+						( isExtraLabelPurchase() &&
+							! isExtraLabelPurchaseValid() )
+					}
+					size="compact"
+				>
+					{ purchaseButtonLabel }
+				</Button>
+			) }
+			{ ! nextPaymentMethod &&
+				document.getElementById( 'label-purchase-status-notices' ) &&
+				createPortal(
+					<Animate
+						type={ isPaymentMethodPolling ? 'loading' : undefined }
+					>
+						{ ( { className } ) => (
+							<div
+								className={ className }
+								style={ { marginBottom: '16px' } }
+							>
+								<Notice status="error" isDismissible={ false }>
+									{ createInterpolateElement(
+										__(
+											'A payment method is required to purchase shipping labels. <ManageLink/>',
+											'woocommerce-shipping'
+										),
+										{
+											ManageLink: (
+												<ExternalLink
+													href={
+														changePaymentMethodUrl
+													}
+													onClick={
+														startPaymentMethodPolling
+													}
+												>
+													{ __(
+														'Add a payment method',
+														'woocommerce-shipping'
+													) }
+												</ExternalLink>
+											),
+										}
+									) }
+								</Notice>
+							</div>
+						) }
+					</Animate>,
+					document.getElementById( 'label-purchase-status-notices' )!
+				) }
+			{ errors &&
+				Object.keys( errors ).length > 0 &&
+				createPortal(
+					<Flex className="purchase-label-errors" direction="column">
+						{ errors && Object.keys( errors ).length > 0 && (
+							<Notice status="error" isDismissible={ false }>
+								{ uniq( errors.message ).map( ( m, index ) => (
+									<Text key={ index }>{ m }</Text>
+								) ) }
+							</Notice>
+						) }
+					</Flex>,
+					document.getElementById( 'label-purchase-status-notices' )!
+				) }
+		</>
+	) : (
 		<>
 			{ UPSDAPTosError && (
 				<UPSDAPTos
@@ -492,6 +700,7 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 									( isExtraLabelPurchase() &&
 										! isExtraLabelPurchaseValid() )
 								}
+								__next40pxDefaultSize={ nextDesign }
 							>
 								{ purchaseButtonLabel }
 							</Button>
@@ -500,7 +709,8 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 							<EssentialDetails />
 						</FlexBlock>
 						{ ! hasPurchasedLabel( false ) &&
-							! isOrderCompleted && (
+							! isOrderCompleted &&
+							! getCurrentShipmentIsReturn() && (
 								<Flex>
 									<CheckboxControl
 										label={ __(
@@ -569,6 +779,7 @@ export const PaymentButtons = ( { order }: PaymentButtonsProps ) => {
 						</>
 					) }
 			</Flex>
+
 			<Spacer />
 			{ errors && Object.keys( errors ).length > 0 && (
 				<Notice
